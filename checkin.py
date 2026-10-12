@@ -1,182 +1,177 @@
 # coding=utf-8
-import requests
+"""
+GLaDOS 自动签到
+
+两种账号来源（二选一，命令行 -c 优先）：
+  1. 命令行：python3 checkin.py -c='gld:sess=xxx; gld:sess.sig=xxx'
+  2. 配置文件（默认 /config/cookies.json，可用 -config_path 指定）：
+     {
+       "http_proxy": "http://192.168.1.8:7890",
+       "https_proxy": "http://192.168.1.8:7890",
+       "user_agent": "全局默认 UA，可选",
+       "cookies": [
+         {"user": "xxx", "cookie": "xxx", "user_agent": "该账号的 UA，可选"}
+       ]
+     }
+
+签到接口会校验设备：user_agent 必须与获取 cookie 时登录的浏览器/系统一致，否则返回 device-mismatch。
+
+运行模式：
+  默认常驻：立即签到一次，之后每天同一时间（加随机抖动）再签到
+  --once：签到一次后退出，有账号失败时退出码为 1，适合 k8s CronJob
+"""
 import argparse
-import time
+import datetime
 import json
 import logging
-import os
-import sys
 import random
+import re
+import sys
+import time
 
-logging.basicConfig(format='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(levelname)s: %(message)s',
-                    level=logging.DEBUG)
+import requests
 
-proxies = {}
-# 签到接口会校验设备，UA 必须与获取 cookie 时登录所用的浏览器/系统一致，否则返回 device-mismatch
-user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-cookies = set()
-cookiesUser = {}
+CHECKIN_URL = "https://glados.cloud/api/user/checkin"
+CHECKIN_PAGE = "https://glados.cloud/console/checkin"
+DEFAULT_CONFIG_PATH = "/config/cookies.json"
+DEFAULT_USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+# code 0：签到成功；code 1：今天已经签到过
+SUCCESS_CODES = (0, 1)
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+
+log = logging.getLogger("glados")
 
 
-def read_configuration():
-    """
-    读取配置
-    """
+def parse_args():
+    parser = argparse.ArgumentParser(description="GLaDOS 自动签到")
+    parser.add_argument("-c", "--cookie", help="cookie，到 %s 页面任意请求的 request header 中整段拷贝" % CHECKIN_PAGE)
+    parser.add_argument("-ua", "--user_agent", help="浏览器 User-Agent，需与获取 cookie 时登录的浏览器一致")
+    parser.add_argument("-http_proxy", "--http_proxy", help="http 代理")
+    parser.add_argument("-https_proxy", "--https_proxy", help="https 代理")
+    parser.add_argument("-config_path", "--config_path", default=DEFAULT_CONFIG_PATH,
+                        help="配置文件路径，可配置多个账号，默认 %s" % DEFAULT_CONFIG_PATH)
+    parser.add_argument("--once", action="store_true", help="只签到一次后退出")
+    return parser.parse_args()
 
-    global proxies
-    global cookies
-    global user_agent
-    http_proxy = None
-    https_proxy = None
-    config_path = None
 
-    # step1.优先获取环境变量
-    env_dist = os.environ
-    # step1.获取系统环境变量中的
-    try:
-        for key in env_dist.keys():
-            if "http_proxy" in key:
-                http_proxy = env_dist.get(key)
-
-            if "https_proxy" in key:
-                https_proxy = env_dist.get(key)
-
-            if "cookie_" in key:
-                if env_dist.get(key) is not None:
-                    cookies.add(str(env_dist.get(key)))
-
-            if "user_agent" in key:
-                user_agent = env_dist.get(key)
-
-            if "config_path" in key:
-                config_path = env_dist.get(key)
-
-    except Exception as e:
-        print("读取系统环境变量异常:", e)
-
-    # step2.获取命令行的
-    if len(cookies) == 0:
+def load_config(args):
+    """返回 (accounts, proxies)，accounts 为 [{"user", "cookie", "user_agent"}]"""
+    if args.cookie:
+        config = {"cookies": [{"user": "default", "cookie": args.cookie}]}
+    else:
         try:
-            # 获取命令行参数
-            parser = argparse.ArgumentParser()
-            parser.add_argument("-c", "--cookie", help='''
-                        请到【https://glados.cloud/console/checkin】页面拷贝cookie, 注意：一定要清除掉cookie值之间的空格，不然无法识别!!!
-                    ''')
-            parser.add_argument("-ua", "--user_agent", help='浏览器 User-Agent，需与获取 cookie 时登录的浏览器一致')
-            parser.add_argument("-http_proxy", "--http_proxy", help='http代理')
-            parser.add_argument("-https_proxy", "--https_proxy", help='https代理')
-            parser.add_argument("-config_path", "--config_path", help='''配置文件路径，可配置多个cookie，格式:
-                        {
-                            "http_proxy": "http://192.168.1.8:7890",
-                            "https_proxy": "http://192.168.1.8:7890",
-                            "user_agent": "xxx",
-                            "cookies": [
-                                {
-                                    "user": "xxx",
-                                    "cookie": "xxx"
-                                }
-                            ]
-                        }
-                    ''')
-            http_proxy = parser.parse_args().http_proxy
-            https_proxy = parser.parse_args().https_proxy
-            config_path = parser.parse_args().config_path
-            if parser.parse_args().user_agent:
-                user_agent = parser.parse_args().user_agent
-            if parser.parse_args().cookie:
-                cookies.add(parser.parse_args().cookie)
-        except Exception as e:
-            print("读取命令行变量异常:", e)
+            with open(args.config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            sys.exit("未找到配置文件 %s，请通过 -c 传入 cookie 或通过 -config_path 指定配置文件" % args.config_path)
+        except json.JSONDecodeError as e:
+            sys.exit("配置文件 %s 不是合法的 JSON：%s" % (args.config_path, e))
 
-    # step3.获取配置文件
-    try:
-        path = "/config/cookies.json"
-        if config_path is not None:
-            path = config_path
+    default_ua = args.user_agent or config.get("user_agent") or DEFAULT_USER_AGENT
+    accounts = []
+    for i, item in enumerate(config.get("cookies") or []):
+        # 没有 cookie 的账号也保留，签到时计为失败，避免配置遗漏被 --once 的退出码掩盖
+        accounts.append({
+            "user": item.get("user") or "account-%d" % (i + 1),
+            "cookie": (item.get("cookie") or "").strip(),
+            "user_agent": item.get("user_agent") or default_ua,
+        })
+    if not accounts:
+        sys.exit("没有配置任何账号，请检查 cookie 配置")
 
-        with open(path, 'r') as load_f:
-            load_dict = json.load(load_f)
-            print(load_dict)
-
-            # 代理
-            http_proxy = load_dict.get('http_proxy', "")
-            https_proxy = load_dict.get('https_proxy', "")
-            user_agent = load_dict.get('user_agent', user_agent)
-
-            for c in load_dict['cookies']:
-                cookies.add(str(c['cookie']))
-                cookiesUser[str(c['cookie'])] = str(c['user'])
-    except Exception as e:
-        print("读取配置文件变量异常:", e)
-
-    # step4.代理
+    # 未配置时 requests 会自动读取 HTTP_PROXY / HTTPS_PROXY 环境变量
+    proxies = {}
+    http_proxy = args.http_proxy or config.get("http_proxy")
+    https_proxy = args.https_proxy or config.get("https_proxy")
     if http_proxy:
-        proxies['http'] = str(http_proxy)
+        proxies["http"] = http_proxy
     if https_proxy:
-        proxies['https'] = str(https_proxy)
+        proxies["https"] = https_proxy
+    return accounts, proxies
 
 
-if __name__ == '__main__':
-    read_configuration()
+def mask_cookie(cookie):
+    """日志中只保留 cookie 名和值的前 6 位"""
+    return re.sub(r"=([^;]{6})[^;]*", r"=\1***", cookie)
 
-    try:
-        logging.info("代理：%s" % str(proxies))
-        if cookies is not None:
-            for cookie in cookies:
-                cookie = str(cookie).replace(" ", "")
-                logging.info("解析到的cookie:[%s]" % cookie)
+
+def checkin(account, proxies):
+    """为单个账号签到，成功返回 True"""
+    headers = {
+        "cookie": account["cookie"],
+        "content-type": "application/json",
+        "user-agent": account["user_agent"],
+        "origin": "https://glados.cloud",
+        "referer": CHECKIN_PAGE,
+        "accept": "application/json, text/plain, */*",
+    }
+    user = account["user"]
+    if not account["cookie"]:
+        log.error("[%s] 签到失败：没有配置 cookie，请到 %s 登录后拷贝 cookie", user, CHECKIN_PAGE)
+        return False
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.post(CHECKIN_URL, json={"token": "glados.one"}, headers=headers,
+                                 proxies=proxies, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError) as e:
+            log.warning("[%s] 第 %d/%d 次请求失败：%s", user, attempt, MAX_RETRIES, e)
+            if attempt < MAX_RETRIES:
+                time.sleep(10 * attempt)
+            continue
+
+        # 业务失败（cookie 失效、设备不匹配等）重试也没用，直接返回
+        if data.get("code") in SUCCESS_CODES:
+            log.info("[%s] 签到成功：%s", user, data.get("message"))
+            return True
+        log.error("[%s] 签到失败：code=%s, reason=%s, message=%s",
+                  user, data.get("code"), data.get("reason"), data.get("message"))
+        if data.get("reason") == "device-mismatch":
+            log.error("[%s] 设备不匹配：登录设备为 %s，请将 user_agent 改为该设备上浏览器的 UA",
+                      user, data.get("loginDevice"))
         else:
-            logging.info("未解析到cookie,请检查启动参数!")
-            sys.exit(0)
+            log.error("[%s] cookie 可能已失效，请到 %s 重新登录后拷贝 cookie", user, CHECKIN_PAGE)
+        return False
 
-        error_count = 0
-        while True:
-            if len(cookies):
-                try:
-                    for cookie in cookies:
-                        headers = {
-                            "cookie": str(cookie),
-                            "content-type": "application/json",
-                            "user-agent": user_agent,
-                            "origin": "https://glados.cloud",
-                            "referer": "https://glados.cloud/console/checkin",
-                            "accept": "*/*",
-                            "cache-control": "no-cache",
-                            "host": "glados.cloud",
-                            "accept-encoding": "gzip, deflate"
-                        }
+    log.error("[%s] 签到失败：重试 %d 次后仍无法请求签到接口", user, MAX_RETRIES)
+    return False
 
-                        result = requests.post(url='https://glados.cloud/api/user/checkin',
-                                               json={"token": "glados.one"},
-                                               headers=headers,
-                                               proxies=proxies).text
-                        nowTime = time.strftime('%Y-%m-%d %X', time.localtime())
-                        result_json = json.loads(result)
-                        # print("time:[%s]  ,response:[%s]" % (nowTime, result_json['message']))
-                        user = cookiesUser.get(cookie)
-                        logging.info(
-                            "time:[%s], user:[%s], response:[%s]" % (nowTime, str(user), result_json['message']))
-                        time.sleep(1)
-                    # 休眠一天
-                    time.sleep(60 * 60 * 24)
-                    # 再随机睡眠
-                    randint = random.randint(0, 60)
-                    time.sleep(randint)
-                except Exception as ex:
-                    logging.error("程序出现异常!" + str(ex))
-                    logging.error("请到【https://glados.cloud/console/checkin】页面拷贝cookie,注意：一定要清除掉cookie值之间的空格，不然无法识别!!!")
-                    time.sleep(60)
-                    error_count = error_count + 1
-                    if error_count > 10:
-                        sys.exit(0)
-            else:
-                logging.info('''
-                        请设置cookie运行,例如：
-                        docker run -itd glados-checkin:1.0.0 --name my-glados-checkin -c='value'
-                        请到【https://glados.cloud/console/checkin】页面拷贝cookie
-                        注意：一定要清除掉cookie值之间的空格，不然无法识别!!!
-                        ''')
-                break
-    except BaseException as ex:
-        logging.error("程序异常!")
-        logging.error(ex)
+
+def checkin_all(accounts, proxies):
+    """所有账号各签到一次，返回失败的账号数"""
+    failed = 0
+    for i, account in enumerate(accounts):
+        if i:
+            time.sleep(random.uniform(1, 3))
+        if not checkin(account, proxies):
+            failed += 1
+    log.info("本轮签到完成：成功 %d，失败 %d", len(accounts) - failed, failed)
+    return failed
+
+
+def main():
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+    args = parse_args()
+    accounts, proxies = load_config(args)
+    log.info("代理：%s", proxies or "未配置")
+    for account in accounts:
+        log.info("账号：[%s] cookie：[%s]", account["user"], mask_cookie(account["cookie"]))
+
+    if args.once:
+        sys.exit(1 if checkin_all(accounts, proxies) else 0)
+
+    # 常驻模式：以首次启动时间为基准，每天同一时间签到，避免每天往后漂移
+    next_run = datetime.datetime.now()
+    while True:
+        checkin_all(accounts, proxies)
+        next_run += datetime.timedelta(days=1)
+        run_at = next_run + datetime.timedelta(seconds=random.randint(0, 600))
+        log.info("下次签到时间：%s", run_at.strftime("%Y-%m-%d %H:%M:%S"))
+        time.sleep(max(0.0, (run_at - datetime.datetime.now()).total_seconds()))
+
+
+if __name__ == "__main__":
+    main()
