@@ -83,7 +83,8 @@ def read_configuration():
             config_path = parser.parse_args().config_path
             if parser.parse_args().user_agent:
                 user_agent = parser.parse_args().user_agent
-            cookies.add(parser.parse_args().cookie)
+            if parser.parse_args().cookie:
+                cookies.add(parser.parse_args().cookie)
         except Exception as e:
             print("读取命令行变量异常:", e)
 
@@ -109,9 +110,9 @@ def read_configuration():
         print("读取配置文件变量异常:", e)
 
     # step4.代理
-    if http_proxy is not None:
+    if http_proxy:
         proxies['http'] = str(http_proxy)
-    if http_proxy is not None:
+    if https_proxy:
         proxies['https'] = str(https_proxy)
 
 
