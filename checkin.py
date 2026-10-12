@@ -12,6 +12,8 @@ logging.basicConfig(format='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(leve
                     level=logging.DEBUG)
 
 proxies = {}
+# 签到接口会校验设备，UA 必须与获取 cookie 时登录所用的浏览器/系统一致，否则返回 device-mismatch
+user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 cookies = set()
 cookiesUser = {}
 
@@ -23,6 +25,7 @@ def read_configuration():
 
     global proxies
     global cookies
+    global user_agent
     http_proxy = None
     https_proxy = None
     config_path = None
@@ -40,7 +43,10 @@ def read_configuration():
 
             if "cookie_" in key:
                 if env_dist.get(key) is not None:
-                    cookies.add(str(cookie))
+                    cookies.add(str(env_dist.get(key)))
+
+            if "user_agent" in key:
+                user_agent = env_dist.get(key)
 
             if "config_path" in key:
                 config_path = env_dist.get(key)
@@ -54,14 +60,16 @@ def read_configuration():
             # 获取命令行参数
             parser = argparse.ArgumentParser()
             parser.add_argument("-c", "--cookie", help='''
-                        请到【https://glados.rocks/console/checkin】页面拷贝cookie, 注意：一定要清除掉cookie值之间的空格，不然无法识别!!!
+                        请到【https://glados.cloud/console/checkin】页面拷贝cookie, 注意：一定要清除掉cookie值之间的空格，不然无法识别!!!
                     ''')
+            parser.add_argument("-ua", "--user_agent", help='浏览器 User-Agent，需与获取 cookie 时登录的浏览器一致')
             parser.add_argument("-http_proxy", "--http_proxy", help='http代理')
             parser.add_argument("-https_proxy", "--https_proxy", help='https代理')
             parser.add_argument("-config_path", "--config_path", help='''配置文件路径，可配置多个cookie，格式:
                         {
                             "http_proxy": "http://192.168.1.8:7890",
                             "https_proxy": "http://192.168.1.8:7890",
+                            "user_agent": "xxx",
                             "cookies": [
                                 {
                                     "user": "xxx",
@@ -73,6 +81,8 @@ def read_configuration():
             http_proxy = parser.parse_args().http_proxy
             https_proxy = parser.parse_args().https_proxy
             config_path = parser.parse_args().config_path
+            if parser.parse_args().user_agent:
+                user_agent = parser.parse_args().user_agent
             cookies.add(parser.parse_args().cookie)
         except Exception as e:
             print("读取命令行变量异常:", e)
@@ -90,6 +100,7 @@ def read_configuration():
             # 代理
             http_proxy = load_dict.get('http_proxy', "")
             https_proxy = load_dict.get('https_proxy', "")
+            user_agent = load_dict.get('user_agent', user_agent)
 
             for c in load_dict['cookies']:
                 cookies.add(str(c['cookie']))
@@ -125,14 +136,16 @@ if __name__ == '__main__':
                         headers = {
                             "cookie": str(cookie),
                             "content-type": "application/json",
-                            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+                            "user-agent": user_agent,
+                            "origin": "https://glados.cloud",
+                            "referer": "https://glados.cloud/console/checkin",
                             "accept": "*/*",
                             "cache-control": "no-cache",
-                            "host": "glados.rocks",
-                            "accept-encoding": "gzip, deflate, br"
+                            "host": "glados.cloud",
+                            "accept-encoding": "gzip, deflate"
                         }
 
-                        result = requests.post(url='https://glados.rocks/api/user/checkin',
+                        result = requests.post(url='https://glados.cloud/api/user/checkin',
                                                json={"token": "glados.one"},
                                                headers=headers,
                                                proxies=proxies).text
@@ -150,7 +163,7 @@ if __name__ == '__main__':
                     time.sleep(randint)
                 except Exception as ex:
                     logging.error("程序出现异常!" + str(ex))
-                    logging.error("请到【https://glados.rocks/console/checkin】页面拷贝cookie,注意：一定要清除掉cookie值之间的空格，不然无法识别!!!")
+                    logging.error("请到【https://glados.cloud/console/checkin】页面拷贝cookie,注意：一定要清除掉cookie值之间的空格，不然无法识别!!!")
                     time.sleep(60)
                     error_count = error_count + 1
                     if error_count > 10:
@@ -159,7 +172,7 @@ if __name__ == '__main__':
                 logging.info('''
                         请设置cookie运行,例如：
                         docker run -itd glados-checkin:1.0.0 --name my-glados-checkin -c='value'
-                        请到【https://glados.rocks/console/checkin】页面拷贝cookie
+                        请到【https://glados.cloud/console/checkin】页面拷贝cookie
                         注意：一定要清除掉cookie值之间的空格，不然无法识别!!!
                         ''')
                 break

@@ -9,7 +9,8 @@
 1. -itd：后台运行，要查看日志请用docker logs命令。
 2. --name：后面跟容器名字。
 3. ly753/glados-checkin:4.0.0：镜像名字
-4. -c='cookie'：到 https://glados.rocks/console/checkin 页面随便找一个接口，查看 request header 中的 Cooike ，整个拷贝下来，然后<b>去除cookie中间的空格</b>，替换到示例中的cookie，运行即可。
+4. -c='cookie'：到 https://glados.cloud/console/checkin 页面随便找一个接口，查看 request header 中的 Cooike ，整个拷贝下来，然后<b>去除cookie中间的空格</b>，替换到示例中的cookie，运行即可。
+5. -ua='User-Agent'（可选）：签到接口会校验设备，UA 必须与获取 cookie 时登录的浏览器/系统一致，否则返回 `device-mismatch`。默认是 macOS Chrome，如在 Windows 等其他系统登录，请从同一个请求的 request header 中拷贝 `User-Agent` 传入。
 
 例如：
 ```shell
