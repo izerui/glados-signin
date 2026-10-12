@@ -1,9 +1,13 @@
-FROM quoinedev/python3.6-pandas-alpine:latest
-MAINTAINER leiyang <leiyang753@gmail.com>
+FROM python:3.12-slim
+LABEL maintainer="leiyang <leiyang753@gmail.com>"
 
-ADD ./ /code
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /code
 
-RUN pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-ENTRYPOINT python3 checkin.py $0 $@
+COPY . .
+
+ENTRYPOINT ["python3", "checkin.py"]
